@@ -4,6 +4,7 @@ import torch.utils.data as data
 from PIL import Image
 import os
 import os.path
+import pandas as pd
 
 
 def pil_loader(path):
@@ -58,6 +59,30 @@ class CelebA(data.Dataset):
             target = self.target_transform(target)
 
         return sample, target
+
+    def __len__(self):
+        return len(self.images)
+
+
+class CelebATest(data.Dataset):
+
+    def __init__(self, root, ann_file, transform=None, loader=default_loader):
+        df = pd.read_csv(os.path.join(root, ann_file), sep=" ", header=None)
+        self.filenames = df[0].tolist()
+
+        self.images = [os.path.join(root, 'img_align_celeba_png', img) for img in self.filenames]
+        self.transform = transform
+        self.loader = loader
+
+    def __getitem__(self, index):
+        filename = self.filenames[index]
+        path = self.images[index]
+        sample = self.loader(path)
+
+        if self.transform is not None:
+            sample = self.transform(sample)
+
+        return sample, filename
 
     def __len__(self):
         return len(self.images)
