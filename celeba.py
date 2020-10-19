@@ -70,7 +70,7 @@ class CelebATest(data.Dataset):
         df = pd.read_csv(os.path.join(root, ann_file), sep=" ", header=None)
         self.filenames = df[0].tolist()
 
-        self.images = [os.path.join(root, 'img_align_celeba_png', img) for img in self.filenames]
+        self.images = [os.path.join(root, 'testset', img) for img in self.filenames]
         self.transform = transform
         self.loader = loader
 
@@ -87,3 +87,35 @@ class CelebATest(data.Dataset):
     def __len__(self):
         return len(self.images)
 
+
+class CelebATestFromDir(data.Dataset):
+
+
+    def __init__(self, root, transform=None, loader=default_loader):
+
+        self.filenames = []
+
+        for dir_, _, files in os.walk(root):
+            for file_name in files:
+                rel_dir = os.path.relpath(dir_, root)
+                rel_file = os.path.join(rel_dir, file_name)
+                if not file_name.endswith(".jpg"):
+                    continue
+                self.filenames.append(rel_file)
+
+        self.images = [os.path.join(root, img) for img in self.filenames]
+        self.transform = transform
+        self.loader = loader
+
+    def __getitem__(self, index):
+        filename = self.filenames[index]
+        path = self.images[index]
+        sample = self.loader(path)
+
+        if self.transform is not None:
+            sample = self.transform(sample)
+
+        return sample, filename
+
+    def __len__(self):
+        return len(self.images)

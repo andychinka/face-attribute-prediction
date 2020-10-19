@@ -8,14 +8,14 @@ import argparse
 import os
 
 import models
-from celeba import CelebATest
+from celeba import CelebATestFromDir
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('-d', '--data', default='.//', type=str)
+parser.add_argument('-d', '--data', default='/home/MSAI/ch0001ka/advcv/testset', type=str)
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
@@ -23,7 +23,6 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet50',
                         ' (default: resnet50)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('--testfile', default='test_list.txt', type=str, metavar='PATH')
 parser.add_argument('--outputfile', default='predictions.txt', type=str, metavar='PATH')
 
 
@@ -34,18 +33,8 @@ def inference():
     global args
     args = parser.parse_args()
 
-    if args.arch.startswith('resnext'):
-        model = models.__dict__[args.arch](
-                    baseWidth=args.base_width,
-                    cardinality=args.cardinality,
-                )
-    elif args.arch.startswith('shufflenet'):
-        model = models.__dict__[args.arch](
-                    groups=args.groups
-                )
-    else:
-        print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+    print("=> creating model '{}'".format(args.arch))
+    model = models.__dict__[args.arch]()
 
     if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
         model.features = torch.nn.DataParallel(model.features)
@@ -67,7 +56,7 @@ def inference():
                                      std=[0.229, 0.224, 0.225])
 
     data_loader = torch.utils.data.DataLoader(
-        CelebATest(args.data, args.testfile, transforms.Compose([
+        CelebATestFromDir(args.data, transforms.Compose([
             transforms.ToTensor(),
             normalize,
         ])),

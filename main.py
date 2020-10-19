@@ -4,6 +4,9 @@ Copyright (c) Wei YANG, 2017
 '''
 from __future__ import print_function
 
+#add this import first to fix the issue: ImportError: /lib64/libstdc++.so.6: version `CXXABI_1.3.9' not found
+import matplotlib.pyplot as plt
+
 import argparse
 import os
 import shutil
@@ -12,8 +15,9 @@ import random
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
+# import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
 import torch.utils.data
@@ -22,10 +26,13 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
 from math import cos, pi
+import tune
 
 from celeba import CelebA
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from tensorboardX import SummaryWriter
+
+from loss import FocalLoss
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -34,28 +41,32 @@ model_names = sorted(name for name in models.__dict__
 
 # Parse arguments
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('-d', '--data', default='path to dataset', type=str)
-parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
+parser.add_argument('-d', '--data', default='/home/MSAI/ch0001ka/face-attribute-prediction/', type=str)
+parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
+
+parser.add_argument('--loss', type=str, default='ce',
+                    help='loss, ce | focalloss')
+
 # Optimization options
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=2, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--train-batch', default=256, type=int, metavar='N',
+parser.add_argument('--train-batch', default=32, type=int, metavar='N',
                     help='train batchsize (default: 256)')
-parser.add_argument('--test-batch', default=200, type=int, metavar='N',
+parser.add_argument('--test-batch', default=32, type=int, metavar='N',
                     help='test batchsize (default: 200)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--lr-decay', type=str, default='step',
                     help='mode for learning rate decay')
-parser.add_argument('--step', type=int, default=30,
+parser.add_argument('--step', type=int, default=10,
                     help='interval for learning rate decay in step mode')
 parser.add_argument('--schedule', type=int, nargs='+', default=[150, 225],
                     help='decrease learning rate at these epochs.')
@@ -80,6 +91,9 @@ parser.add_argument('--groups', type=int, default=3, help='ShuffleNet model grou
 parser.add_argument('--manual-seed', type=int, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
+parser.add_argument('--e_file', type=str, default='test_40_att_list.txt',
+                    help='file to evaluate')
+
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('--world-size', default=1, type=int,
@@ -92,13 +106,36 @@ parser.add_argument('--dist-backend', default='gloo', type=str,
 parser.add_argument('--gpu-id', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 
+parser.add_argument('-t', '--tune', dest='tune', action='store_true',
+                    help='enable ray tune')
 
 best_prec1 = 0
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("device: ", device)
 
-def main():
+
+def main(c: dict):
     global args, best_prec1
-    args = parser.parse_args()
+
+    # if using tune, config will overwrite the args
+    # TODO: write in a generic way
+    # configable_list = ["lr", "arch", "lr_decay", "step", "loss"]
+    # for c_name in configable_list:
+    #     if c_name in c:
+    #         args.
+
+    if "lr" in c:
+        args.lr = c["lr"]
+    if "arch" in c:
+        args.arch = c["arch"]
+    if "lr_decay" in c:
+        args.lr_decay = c["lr_decay"]
+    if "step" in c:
+        args.step = c["step"]
+    if "loss" in c:
+        args.loss = c["loss"]
+
 
     args.distributed = args.world_size > 1
 
@@ -121,11 +158,11 @@ def main():
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
-    elif args.arch.startswith('resnext'):
-        model = models.__dict__[args.arch](
-                    baseWidth=args.base_width,
-                    cardinality=args.cardinality,
-                )
+    # elif args.arch.startswith('resnext'):
+    #     model = models.__dict__[args.arch](
+    #                 baseWidth=args.base_width,
+    #                 cardinality=args.cardinality,
+    #             )
     elif args.arch.startswith('shufflenet'):
         model = models.__dict__[args.arch](
                     groups=args.groups
@@ -137,15 +174,20 @@ def main():
     if not args.distributed:
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
             model.features = torch.nn.DataParallel(model.features)
-            model.cuda()
+            model.to(device) #.cuda()
         else:
-            model = torch.nn.DataParallel(model).cuda()
+            model = torch.nn.DataParallel(model).to(device) #.cuda()
     else:
-        model.cuda()
+        model.to(device)#.cuda()
         model = torch.nn.parallel.DistributedDataParallel(model)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    if args.loss == "ce":
+        criterion = nn.CrossEntropyLoss().to(device)#.cuda()
+    elif args.loss == "focalloss":
+        criterion = FocalLoss(device)
+    else:
+        print("ERROR: ------ Unkown loss !!! ------")
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -159,7 +201,7 @@ def main():
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            checkpoint = torch.load(args.resume, map_location=device)
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
@@ -174,8 +216,8 @@ def main():
         logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
         logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
-
-    cudnn.benchmark = True
+    # Comment to avoid the cudnn cloud pickle error
+    # cudnn.benchmark = True
 
     # Data loading code
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -208,7 +250,7 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     test_loader = torch.utils.data.DataLoader(
-        CelebA(args.data, 'test_40_att_list.txt', transforms.Compose([
+        CelebA(args.data, args.e_file, transforms.Compose([
             transforms.ToTensor(),
             normalize,
         ])),
@@ -216,11 +258,13 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(test_loader, model, criterion)
+        val_loss, prec1, top1_avg_att = validate(test_loader, model, criterion)
+        print(top1_avg_att)
         return
 
     # visualization
-    writer = SummaryWriter(os.path.join(args.checkpoint, 'logs'))
+    if not args.tune:
+        writer = SummaryWriter(os.path.join(args.checkpoint, 'logs'))
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -233,18 +277,25 @@ def main():
         train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch)
 
         # evaluate on validation set
-        val_loss, prec1 = validate(val_loader, model, criterion)
+        val_loss, prec1, top1_avg_att = validate(val_loader, model, criterion)
 
         # append logger file
         logger.append([lr, train_loss, val_loss, train_acc, prec1])
 
+        acc_att_dict = {}
+        for i, acc in enumerate(top1_avg_att):
+            acc_att_dict[f"att-{i}"] = acc
         # tensorboardX
-        writer.add_scalar('learning rate', lr, epoch + 1)
-        writer.add_scalars('loss', {'train loss': train_loss, 'validation loss': val_loss}, epoch + 1)
-        writer.add_scalars('accuracy', {'train accuracy': train_acc, 'validation accuracy': prec1}, epoch + 1)
+        if not args.tune:
+            writer.add_scalar('learning rate', lr, epoch + 1)
+            writer.add_scalars('loss', {'train loss': train_loss, 'validation loss': val_loss}, epoch + 1)
+            writer.add_scalars('accuracy', {'train accuracy': train_acc, 'validation accuracy': prec1}, epoch + 1)
+            writer.add_scalars('att-accuracy', acc_att_dict, epoch + 1)
         #for name, param in model.named_parameters():
         #    writer.add_histogram(name, param.clone().cpu().data.numpy(), epoch + 1)
 
+        if args.tune:
+            tune.report(train_loss=train_loss, train_acc=train_acc, val_loss=val_loss, prec1=prec1, att_acc=acc_att_dict, lr=lr)
 
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
@@ -259,7 +310,8 @@ def main():
     logger.close()
     logger.plot()
     savefig(os.path.join(args.checkpoint, 'log.eps'))
-    writer.close()
+    if not args.tune:
+        writer.close()
 
     print('Best accuracy:')
     print(best_prec1)
@@ -342,7 +394,7 @@ def validate(val_loader, model, criterion):
             # measure data loading time
             data_time.update(time.time() - end)
 
-            target = target.cuda(non_blocking=True)
+            target = target.to(device) #.cuda(non_blocking=True)
 
             # compute output
             output = model(input)
@@ -377,7 +429,9 @@ def validate(val_loader, model, criterion):
                     )
         bar.next()
     bar.finish()
-    return (loss_avg, prec1_avg)
+
+    # print(top1_avg)
+    return (loss_avg, prec1_avg, top1_avg)
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
@@ -414,4 +468,39 @@ def adjust_learning_rate(optimizer, epoch):
 
 
 if __name__ == '__main__':
-    main()
+    global args
+    args = parser.parse_args()
+
+    if args.tune:
+        import ray
+        from ray import tune
+
+        # import hyperopt as hp
+        # from ray.tune.suggest.hyperopt import HyperOptSearch
+
+        ray.shutdown()
+        ray.init(local_mode=True)
+
+        config = {
+            # "lr": tune.grid_search([0.1, 0.5]),
+            "lr": tune.grid_search([0.005]),
+            # "arch": tune.grid_search(["resnext50_32x4d", "resnet50"]),
+            "arch": tune.grid_search(["resnext50_32x4d"]),
+            # "step": tune.grid_search([5]),
+            "lr_decay": tune.grid_search(["linear"]),
+            "loss": tune.grid_search(["focalloss"]),
+            # "remark": tune.grid_search(["resume_linear"])
+        }
+        # hyperopt = HyperOptSearch(metric="valid_loss", mode="min", space=config)
+
+        tune.run(main,
+                 config=config,
+                 name="run_report",
+                 local_dir="./ray_results",
+                 # search_alg=hyperopt,
+                 # num_samples=2,
+                 # stop={"training_iteration": 5},
+                 resources_per_trial={"gpu": 1}
+                 )
+    else:
+        main({})
